@@ -449,7 +449,10 @@ async def wait_for_agents(  # noqa: PLR0911
 
     await coordinator.park_waiting(me, wait_kind="agents")
     try:
-        await asyncio.wait_for(coordinator.wait_for_message(me), timeout_seconds)
+        # Blocking here holds this agent's run slot, so give it back first: the
+        # agent we are waiting on may be the one queued for it.
+        async with coordinator.slots.released(me):
+            await asyncio.wait_for(coordinator.wait_for_message(me), timeout_seconds)
     except TimeoutError:
         await coordinator.mark_running(me)
         return json.dumps(
@@ -593,6 +596,12 @@ async def create_agent(
             ensure_ascii=False,
             default=str,
         )
+
+    # The child is registered but may be queued behind the concurrency limit;
+    # say so, or the parent keeps spawning specialists that cannot start.
+    slots = coordinator.slots.snapshot()
+    if isinstance(result, dict) and (slot_note := slots.describe()):
+        result = {**result, "slots": slot_note}
 
     logger.info(
         "create_agent: spawned %s (%s) parent=%s skills=%d task_len=%d",

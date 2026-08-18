@@ -118,6 +118,11 @@ class RuntimeSettings(BaseSettings):
     backend: str = Field(default="docker", alias="STRIX_RUNTIME_BACKEND")
     # Max screenshot/image tool outputs kept live per agent context (0 = none).
     max_context_images: int = Field(default=3, ge=0, alias="STRIX_MAX_CONTEXT_IMAGES")
+    # Max sub-agents running turns at once (0 = unlimited). Sized for local LLM
+    # servers, where every extra concurrent agent is another conversation prefix
+    # competing for the same prompt cache. The root agent is exempt, so peak
+    # concurrency is this value plus root.
+    max_concurrent_agents: int = Field(default=0, ge=0, alias="STRIX_MAX_CONCURRENT_AGENTS")
 
 
 class TelemetrySettings(BaseSettings):

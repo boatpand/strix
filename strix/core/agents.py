@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal, cast
 
 from strix.core.sessions import session_write_lock
+from strix.core.slots import AgentSlots
 
 
 if TYPE_CHECKING:
@@ -61,6 +62,8 @@ class AgentCoordinator:
         self.idle_resume_counts: dict[str, int] = {}
         self.wait_kinds: dict[str, WaitKind] = {}
         self.runtimes: dict[str, AgentRuntime] = {}
+        # Unlimited until the scan runner applies the configured limit.
+        self.slots = AgentSlots()
         self._parent_notified: set[str] = set()
         self._lock = asyncio.Lock()
         self._snapshot_path: Path | None = None
@@ -72,6 +75,16 @@ class AgentCoordinator:
 
     def set_snapshot_path(self, path: Path) -> None:
         self._snapshot_path = path
+
+    def configure_slots(self, limit: int) -> None:
+        """Bound concurrently running sub-agents; ``limit <= 0`` leaves it unlimited.
+
+        Must be called before any agent starts: replacing the gate under running
+        agents would lose their holds.
+        """
+        self.slots = AgentSlots(limit)
+        if self.slots.enabled:
+            logger.info("agent concurrency limited to %d running sub-agents", limit)
 
     def mark_shutting_down(self) -> None:
         self.is_shutting_down = True

@@ -144,6 +144,23 @@ When remote vars are set, Strix dual-writes telemetry to both local JSONL and th
   Runtime backend for the sandbox environment.
 </ParamField>
 
+## Agent Concurrency
+
+<ParamField path="STRIX_MAX_CONCURRENT_AGENTS" default="0" type="integer">
+  Maximum sub-agents driving the model at once (`0` = unlimited).
+
+  Aimed at local LLM servers: each agent carries its own conversation prefix, so
+  several running in parallel evict each other's prompt cache and the server
+  spends its time re-prefilling. Set this to the number of slots your server
+  serves (e.g. llama.cpp `-np`).
+
+  A slot is held while an agent is actively running turns and released whenever
+  it parks or waits on another agent. Over the limit, `create_agent` still
+  returns immediately — the child is registered and starts as soon as a slot
+  frees, and the spawning agent is told how many slots are busy. The root agent
+  is exempt, so peak concurrency is this value plus root.
+</ParamField>
+
 ## Sandbox Configuration
 
 <ParamField path="STRIX_SANDBOX_EXECUTION_TIMEOUT" default="120" type="integer">

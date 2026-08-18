@@ -53,7 +53,7 @@ def _settings() -> Any:
             prompt_cache=True,
             extra_headers=None,
         ),
-        runtime=types.SimpleNamespace(max_context_images=3),
+        runtime=types.SimpleNamespace(max_context_images=3, max_concurrent_agents=0),
     )
 
 

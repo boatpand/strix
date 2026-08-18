@@ -261,21 +261,27 @@ async def _run_agent_loop(
     if reserve_stopped and start_parked and interactive and context.get("parent_id") is None:
         await coordinator.send(agent_id, _reserve_notice())
 
+    # Root never queues behind its own children: it can stall without passing
+    # through a slot-release point, and holding the last slot there would strand
+    # the child it is waiting on.
+    slot_exempt = context.get("parent_id") is None
+
     if not (start_parked and interactive):
         with contextlib.suppress(BudgetPausedError):
-            result = await _run_until_lifecycle(
-                agent,
-                coordinator,
-                agent_id,
-                initial_input=first_cycle_input,
-                run_config=run_config,
-                context=context,
-                max_turns=max_turns,
-                session=session,
-                interactive=interactive,
-                event_sink=event_sink,
-                hooks=hooks,
-            )
+            async with coordinator.slots.hold(agent_id, exempt=slot_exempt):
+                result = await _run_until_lifecycle(
+                    agent,
+                    coordinator,
+                    agent_id,
+                    initial_input=first_cycle_input,
+                    run_config=run_config,
+                    context=context,
+                    max_turns=max_turns,
+                    session=session,
+                    interactive=interactive,
+                    event_sink=event_sink,
+                    hooks=hooks,
+                )
 
     if not interactive:
         return result
@@ -325,19 +331,20 @@ async def _run_agent_loop(
 
         await coordinator.consume_pending(agent_id)
         with contextlib.suppress(BudgetPausedError):
-            result = await _run_until_lifecycle(
-                agent,
-                coordinator,
-                agent_id,
-                initial_input=[],
-                run_config=run_config,
-                context=context,
-                max_turns=max_turns,
-                session=session,
-                interactive=True,
-                event_sink=event_sink,
-                hooks=hooks,
-            )
+            async with coordinator.slots.hold(agent_id, exempt=slot_exempt):
+                result = await _run_until_lifecycle(
+                    agent,
+                    coordinator,
+                    agent_id,
+                    initial_input=[],
+                    run_config=run_config,
+                    context=context,
+                    max_turns=max_turns,
+                    session=session,
+                    interactive=True,
+                    event_sink=event_sink,
+                    hooks=hooks,
+                )
 
 
 async def spawn_child_agent(

@@ -257,6 +257,7 @@ async def run_strix_scan(
     if coordinator is None:
         coordinator = AgentCoordinator()
     coordinator.set_snapshot_path(agents_path)
+    coordinator.configure_slots(settings.runtime.max_concurrent_agents)
 
     from strix.tools.coverage.tools import hydrate_coverage_from_disk
     from strix.tools.notes.tools import hydrate_notes_from_disk
