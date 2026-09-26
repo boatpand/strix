@@ -290,6 +290,13 @@ export LLM_API_KEY="your-api-key"
 
 # Optional
 export LLM_API_BASE="your-api-base-url"  # if using a local model, e.g. Ollama, LMStudio
+<<<<<<< Updated upstream
+=======
+export PERPLEXITY_API_KEY="your-api-key"  # for search capabilities
+export STRIX_REASONING_EFFORT="high"  # control thinking effort (default: high, quick scan: medium)
+export STRIX_CONTEXT_TOKENIZER_MAP="qwen=Qwen/Qwen2.5-72B-Instruct"  # map model-name substrings to HF tokenizer repo ids for accurate context-budget counting on non-built-in models (default: unset, uses LiteLLM's cl100k_base estimate)
+export STRIX_TURN_MAX_OUTPUT_TOKENS="32768"  # per-turn output cap incl. hidden reasoning tokens (default: model's LiteLLM output limit, or 32768 for unrecognized models; capped at half the context window)
+>>>>>>> Stashed changes
 ```
 
 > [!NOTE]

@@ -140,6 +140,7 @@ def _patch_budget(monkeypatch: pytest.MonkeyPatch, *, keep_tokens: int, window: 
     monkeypatch.setattr(compaction, "count_tokens", lambda _m, t: len(t))
     monkeypatch.setattr(compaction, "context_window", lambda _m: window)
     monkeypatch.setattr(compaction, "output_limit", lambda _m: 0)
+    monkeypatch.setattr(compaction, "turn_output_tokens", lambda _m: 0)
     context = ContextSettings()
     context.keep_tokens = keep_tokens
     context.compact_buffer_tokens = 0
@@ -186,6 +187,18 @@ async def test_maybe_compact_noop_when_within_budget(monkeypatch: pytest.MonkeyP
 
     assert await compaction.maybe_compact(session, model="m") is False
     assert await session.get_items() == before
+
+
+@pytest.mark.asyncio
+async def test_maybe_compact_reserves_turn_output_tokens(monkeypatch: pytest.MonkeyPatch) -> None:
+    # History that fits the window still compacts once it leaves no room for the
+    # output each turn requests, or the provider would reject prompt + max_tokens.
+    _patch_budget(monkeypatch, keep_tokens=30, window=1_000_000)
+    monkeypatch.setattr(compaction, "turn_output_tokens", lambda _m: 1_000_000 - 50)
+    _patch_summary(monkeypatch, "SUMMARY BODY")
+    session = FakeSession(_turns(12))
+
+    assert await compaction.maybe_compact(session, model="m") is True
 
 
 @pytest.mark.asyncio

@@ -21,7 +21,12 @@ from strix.config import load_settings
 from strix.config.models import StrixProvider
 from strix.core.inputs import make_model_settings
 from strix.core.sessions import replace_session_items, session_write_lock
-from strix.llm.context_budget import context_window, count_tokens, output_limit
+from strix.llm.context_budget import (
+    context_window,
+    count_tokens,
+    output_limit,
+    turn_output_tokens,
+)
 
 
 if TYPE_CHECKING:
@@ -359,7 +364,8 @@ async def maybe_compact(
         return False
 
     window = context_window(model)
-    reserve = max(context.compact_buffer_tokens, output_limit(model))
+    # Reserve what each turn actually requests, so history plus output fits.
+    reserve = max(context.compact_buffer_tokens, turn_output_tokens(model))
     budget = max(context.keep_tokens, window - reserve)
     used = count_tokens(model, "\n".join((instructions, tools_text, _serialize_items(items))))
     if not force and used <= budget:

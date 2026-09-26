@@ -8,6 +8,7 @@ from typing import TYPE_CHECKING, Any
 from agents.model_settings import ModelSettings
 from openai.types.shared import Reasoning
 
+from strix.config.codex import subscription_model
 from strix.config.models import (
     DEFAULT_MODEL_RETRY,
     OPENROUTER_ATTRIBUTION_HEADERS,
@@ -21,6 +22,7 @@ from strix.config.models import (
     routes_through_litellm,
 )
 from strix.core.sessions import scrub_images_from_items
+from strix.llm.context_budget import turn_output_tokens
 
 
 if TYPE_CHECKING:
@@ -261,6 +263,7 @@ def make_model_settings(
         include_usage=True,
         extra_args=request_timeout_extra_args(request_timeout),
         extra_headers=headers,
+        max_tokens=_turn_max_tokens(model_name),
     )
     if (
         reasoning_effort is not None
@@ -281,6 +284,15 @@ def make_model_settings(
             ),
         )
     return model_settings
+
+
+def _turn_max_tokens(model_name: str) -> int | None:
+    """Explicit per-turn output cap, so reasoning models are not truncated by a
+    small server-side default. The ChatGPT subscription backend is left uncapped.
+    """
+    if subscription_model(model_name):
+        return None
+    return turn_output_tokens(model_name)
 
 
 def _request_headers(

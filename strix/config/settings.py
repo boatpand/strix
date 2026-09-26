@@ -100,6 +100,16 @@ class ContextSettings(BaseSettings):
         default=200_000, gt=0, alias="STRIX_CONTEXT_FALLBACK_TOKENS"
     )
     summary_max_tokens: int = Field(default=4_096, gt=0, alias="STRIX_CONTEXT_SUMMARY_TOKENS")
+    # Maps model-name substrings to HuggingFace tokenizer repo ids (comma-separated
+    # "substring=repo_id" pairs), so token counting can use a model's real tokenizer
+    # instead of LiteLLM's cl100k_base fallback for models it doesn't recognize.
+    tokenizer_map: str = Field(default="", alias="STRIX_CONTEXT_TOKENIZER_MAP")
+    # Per-turn output cap (``max_tokens``), hidden reasoning included. Unset: the
+    # model's LiteLLM limit, or a reasoning-sized default for unmapped models.
+    # Never left to the inference server's own (often small) default.
+    turn_max_output_tokens: int | None = Field(
+        default=None, gt=0, alias="STRIX_TURN_MAX_OUTPUT_TOKENS"
+    )
     tool_output_max_tokens: int = Field(default=8_000, gt=0, alias="STRIX_TOOL_OUTPUT_MAX_TOKENS")
     tool_output_max_lines: int = Field(default=2_000, gt=0, alias="STRIX_TOOL_OUTPUT_MAX_LINES")
     # Floor above the truncation-notice size so a preview always fits.

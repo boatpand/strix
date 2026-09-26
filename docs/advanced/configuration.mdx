@@ -45,6 +45,10 @@ Configure Strix using environment variables or a config file.
   Control thinking effort for reasoning models. Valid values: `none`, `minimal`, `low`, `medium`, `high`, `xhigh`, `max`. Defaults to `medium` for quick scan mode.
 </ParamField>
 
+<ParamField path="STRIX_TURN_MAX_OUTPUT_TOKENS" type="integer">
+  Maximum output tokens per agent turn (`max_tokens`), including hidden reasoning/thinking tokens. When unset, Strix uses the model's output limit from LiteLLM, or `32768` for models LiteLLM doesn't recognize (e.g. self-hosted models). Always capped at half the model's context window. Raise it if a reasoning model's tool calls are truncated (`function.arguments must be valid JSON`); when set, it applies to every model.
+</ParamField>
+
 <ParamField path="STRIX_MEMORY_COMPRESSOR_TIMEOUT" default="30" type="integer">
   Timeout in seconds for memory compression operations (context summarization).
 </ParamField>

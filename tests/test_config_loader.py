@@ -37,6 +37,9 @@ _LLM_ENV_KEYS = [
     "STRIX_RUNTIME_BACKEND",
     # TelemetrySettings
     "STRIX_TELEMETRY",
+    # ContextSettings
+    "STRIX_CONTEXT_TOKENIZER_MAP",
+    "STRIX_TURN_MAX_OUTPUT_TOKENS",
 ]
 
 

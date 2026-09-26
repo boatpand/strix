@@ -8,6 +8,7 @@ from typing import Any
 import litellm
 import pytest
 
+from strix.config import loader
 from strix.core.inputs import (
     build_root_task,
     build_scan_targets,
@@ -431,3 +432,31 @@ def test_user_headers_override_openrouter_attribution() -> None:
     assert headers["X-Title"] == "Custom"
     assert headers["X-Tenant"] == "acme"
     assert headers["HTTP-Referer"] == "https://strix.ai"
+
+
+def test_make_model_settings_caps_turn_output_for_known_model() -> None:
+    # gpt-4o is mapped by LiteLLM at 16,384 output tokens.
+    assert make_model_settings("none", model_name="gpt-4o").max_tokens == 16_384
+
+
+def test_make_model_settings_caps_turn_output_for_unmapped_model() -> None:
+    # Never left to the inference server's default, which truncates reasoning models.
+    settings = make_model_settings("high", model_name="openai/custom-qwen3-reasoner")
+    assert settings.max_tokens == 32_768
+
+
+def test_make_model_settings_turn_output_env_override(monkeypatch: Any) -> None:
+    monkeypatch.setenv("STRIX_TURN_MAX_OUTPUT_TOKENS", "20000")
+    monkeypatch.setattr(loader, "_cached", None)
+    try:
+        assert make_model_settings("high", model_name="gpt-4o").max_tokens == 20_000
+        assert (
+            make_model_settings("high", model_name="openai/custom-qwen3-reasoner").max_tokens
+            == 20_000
+        )
+    finally:
+        loader._cached = None
+
+
+def test_make_model_settings_leaves_chatgpt_subscription_uncapped() -> None:
+    assert make_model_settings("high", model_name="chatgpt/gpt-5").max_tokens is None
