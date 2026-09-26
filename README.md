@@ -291,6 +291,9 @@ export LLM_API_KEY="your-api-key"
 # Optional
 export LLM_API_BASE="your-api-base-url"  # if using a local model, e.g. Ollama, LMStudio
 export STRIX_CONTEXT_TOKENIZER_MAP="qwen=Qwen/Qwen2.5-72B-Instruct"  # map model-name substrings to HF tokenizer repo ids for accurate context-budget counting on non-built-in models (default: unset, uses LiteLLM's cl100k_base estimate)
+export STRIX_CONTEXT_BUFFER_TOKENS="20000"  # headroom held back from the context window on top of the per-turn output cap; compaction starts at context_window - (turn output cap + this). Raise it if scans still hit context-length errors
+export STRIX_CONTEXT_KEEP_TOKENS="8000"  # how much recent conversation compaction keeps verbatim instead of summarising
+export STRIX_CONTEXT_FALLBACK_TOKENS="200000"  # context window assumed for models LiteLLM doesn't recognize (set this to your server's real window when self-hosting)
 export STRIX_TURN_MAX_OUTPUT_TOKENS="32768"  # per-turn output cap incl. hidden reasoning tokens (default: model's LiteLLM output limit, or 32768 for unrecognized models; capped at half the context window)
 ```
 

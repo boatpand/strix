@@ -24,6 +24,7 @@ from strix.core.sessions import replace_session_items, session_write_lock
 from strix.llm.context_budget import (
     context_window,
     count_tokens,
+    count_tokens_cached,
     output_limit,
     turn_output_tokens,
 )
@@ -37,8 +38,14 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 _CHECKPOINT_TAG = "<conversation-checkpoint>"
+_ELISION_TAG = "<context-guard-elision>"
 _TOOL_OUTPUT_MAX_CHARS = 2_000
 _MIN_ITEMS_TO_COMPACT = 6
+# Wire framing each item costs beyond its text (role marker, delimiters, ids).
+# ``litellm.token_counter(text=...)`` counts none of it, so add it per item.
+_ITEM_FRAMING_OVERHEAD_TOKENS = 4
+# Room set aside for the elision notice the guard prepends.
+_ELISION_NOTICE_TOKENS = 64
 _HEAD_TRUNCATED_MARKER = "\n\n[... older conversation omitted to fit the summary request ...]\n\n"
 
 
@@ -192,6 +199,85 @@ def _serialize_items(items: list[Any]) -> str:
     return "\n".join(s for s in (_serialize_item(item) for item in items) if s)
 
 
+def _full_item_text(item: Any) -> str:
+    """Untruncated rendering of ``item``, for budget measurement only.
+
+    ``_serialize_item`` exists to build a *summary prompt*, so it caps tool
+    payloads and drops reasoning. Measuring a request with it understates the
+    real payload by 10-25x on histories dominated by large tool output, which
+    is how a session can sail past the context window while the budget check
+    still reads as comfortably under. Nothing here truncates.
+    """
+    if not isinstance(item, dict):
+        return str(item)
+    item_type = item.get("type")
+    role = item.get("role")
+    if item_type == "function_call":
+        return f"{item.get('name', '?')} {item.get('arguments', '')}"
+    if item_type == "function_call_output":
+        output = item.get("output")
+        return output if isinstance(output, str) else _content_text(output)
+    if item_type == "reasoning":
+        # Reasoning round-trips on the wire for reasoning models, so it counts.
+        summary = item.get("summary")
+        parts = [
+            block.get("text", "")
+            for block in (summary if isinstance(summary, list) else [])
+            if isinstance(block, dict)
+        ]
+        parts.append(_content_text(item.get("content")))
+        return "\n".join(part for part in parts if part)
+    if role or item_type == "message":
+        return _content_text(item.get("content"))
+    # Unknown item types still occupy the window; never measure them as zero.
+    return str(item)
+
+
+def measure_item_tokens(model: str, item: Any) -> int:
+    """Tokens ``item`` contributes to a request, framing included."""
+    return count_tokens_cached(model, _full_item_text(item)) + _ITEM_FRAMING_OVERHEAD_TOKENS
+
+
+def measure_items_tokens(model: str, items: list[Any]) -> int:
+    return sum(measure_item_tokens(model, item) for item in items)
+
+
+def measure_prompt_overhead(model: str, instructions: str, tools_text: str) -> int:
+    """Fixed per-request cost of the system prompt plus tool schemas."""
+    return count_tokens_cached(model, instructions) + count_tokens_cached(model, tools_text)
+
+
+def measure_request_tokens(model: str, instructions: str, tools_text: str, items: list[Any]) -> int:
+    """Tokens a request carrying ``items`` would send, as sent on the wire."""
+    return measure_prompt_overhead(model, instructions, tools_text) + measure_items_tokens(
+        model, items
+    )
+
+
+def reserve_tokens(model: str) -> int:
+    """Context set aside from the window before history may use it.
+
+    Additive, not ``max()``: the two terms cover independent needs. The turn
+    output cap is room the request provably needs for the completion it is
+    about to ask for, while ``STRIX_CONTEXT_BUFFER_TOKENS`` is slack for the
+    error between a local token estimate and the provider's own count. Taking
+    whichever is larger lets one silently stand in for the other, leaving the
+    completion no cushion of its own.
+    """
+    context = load_settings().context
+    turn = turn_output_tokens(model)
+    window = context_window(model)
+    # Clamp the buffer so a large STRIX_CONTEXT_BUFFER_TOKENS on a small-window
+    # model cannot drive the budget down to the keep_tokens floor.
+    buffer = min(context.compact_buffer_tokens, max(0, window - turn - context.keep_tokens))
+    return turn + buffer
+
+
+def budget_tokens(model: str) -> int:
+    """Largest request ``model`` may be sent, completion room excluded."""
+    return max(load_settings().context.keep_tokens, context_window(model) - reserve_tokens(model))
+
+
 def _is_tool_call(item: Any) -> bool:
     return isinstance(item, dict) and item.get("type") == "function_call"
 
@@ -216,7 +302,7 @@ def _select_split(model: str, items: list[Any], keep_tokens: int) -> int:
     total = 0
     split = len(items)
     for i in range(len(items) - 1, -1, -1):
-        total += count_tokens(model, _serialize_item(items[i]))
+        total += measure_item_tokens(model, items[i])
         if total > keep_tokens:
             break
         split = i
@@ -224,6 +310,100 @@ def _select_split(model: str, items: list[Any], keep_tokens: int) -> int:
     while split > 0 and open_calls[split] != 0:
         split -= 1
     return split
+
+
+def _guard_split(model: str, items: list[Any], budget: int) -> int:
+    """Index of the first item to keep so ``items[split:]`` fits ``budget``.
+
+    The hard-cap counterpart to ``_select_split``. The difference that matters
+    is the direction of the tool-pair snap: ``_select_split`` walks the
+    boundary *backwards*, growing the retained tail, which is fine when the
+    head is still going to be summarised. A hard cap cannot afford that, since
+    growing the tail can push it back over budget, so this walks *forwards* and
+    only ever drops more.
+    """
+    total = 0
+    split = len(items)
+    for i in range(len(items) - 1, -1, -1):
+        total += measure_item_tokens(model, items[i])
+        if total > budget:
+            break
+        split = i
+    open_calls = _open_calls_at(items)
+    while split < len(items) and open_calls[split] != 0:
+        split += 1
+    # A pre-existing orphan output would survive the balance check above.
+    while split < len(items) and _is_tool_output(items[split]):
+        split += 1
+    return split
+
+
+def _collect_pins(items: list[Any]) -> list[Any]:
+    """Items the guard must never drop: the checkpoint and the opening turn.
+
+    The checkpoint carries every earlier finding the agent has compacted away,
+    so dropping it loses the whole engagement's state.
+    """
+    pins: list[Any] = []
+    seen: set[int] = set()
+    for index, item in enumerate(items):
+        if not isinstance(item, dict) or id(item) in seen:
+            continue
+        role = item.get("role")
+        if role not in {"user", "system"}:
+            continue
+        is_checkpoint = role == "user" and _content_text(item.get("content")).startswith(
+            _CHECKPOINT_TAG
+        )
+        if is_checkpoint or index == 0:
+            seen.add(id(item))
+            pins.append(item)
+    return pins
+
+
+def _elision_item(dropped: int) -> dict[str, Any]:
+    return {
+        "role": "user",
+        "content": (
+            f"{_ELISION_TAG} {dropped} older conversation item(s) were dropped to fit the "
+            f"model's context window. Re-read any file or re-run any command whose output "
+            f"you still need."
+        ),
+    }
+
+
+def guard_trim_items(
+    model: str, instructions: str, tools_text: str, items: list[Any], budget: int
+) -> list[Any]:
+    """Drop the oldest items until a request carrying them fits ``budget``.
+
+    Whole items are dropped rather than their payloads truncated: these dicts
+    may be the session's own, so rewriting a field in place risks corrupting
+    the persisted history. Replacing list entries touches only the list, and
+    every retained item stays byte-identical. Lossy rewriting is
+    ``maybe_compact``'s job; this stays a mechanical backstop.
+    """
+    pins = _collect_pins(items)
+    pin_ids = {id(pin) for pin in pins}
+    fixed = (
+        measure_prompt_overhead(model, instructions, tools_text)
+        + measure_items_tokens(model, pins)
+        + _ELISION_NOTICE_TOKENS
+    )
+    split = _guard_split(model, items, max(0, budget - fixed))
+    tail = [item for item in items[split:] if id(item) not in pin_ids]
+    dropped = len(items) - len(pins) - len(tail)
+    if dropped <= 0:
+        return list(items)
+    if not tail:
+        logger.critical(
+            "context guard dropped every recent item for %s: pinned context alone "
+            "(~%d tok) exceeds the %d-token budget",
+            model,
+            fixed,
+            budget,
+        )
+    return [*pins, _elision_item(dropped), *tail]
 
 
 def _previous_summary(head: list[Any]) -> str | None:
@@ -347,12 +527,18 @@ async def maybe_compact(
     model: str,
     instructions: str = "",
     tools_text: str = "",
+    min_overhead_tokens: int = 0,
     force: bool = False,
 ) -> bool:
     """Compact ``session`` if it is near the model's context window.
 
     Returns ``True`` when the session was rewritten. ``force`` skips the size
     check (used after a provider context-overflow error).
+
+    ``min_overhead_tokens`` is a floor for the instructions-plus-tools cost,
+    supplied by the run hooks once they have seen a real request. The agent
+    object here carries only its own instructions, while the SDK sends a much
+    larger prepared system prompt and extra capability tool schemas.
     """
     context = load_settings().context
     if not context.auto_compact and not force:
@@ -360,14 +546,15 @@ async def maybe_compact(
 
     async with session_write_lock(session):
         items = list(await session.get_items())
-    if len(items) < _MIN_ITEMS_TO_COMPACT:
+    # The count gate is a cheap guard against churning on a barely-started
+    # session; a forced pass is recovering from a real overflow, where even a
+    # handful of enormous items has to be compacted.
+    if not force and len(items) < _MIN_ITEMS_TO_COMPACT:
         return False
 
-    window = context_window(model)
-    # Reserve what each turn actually requests, so history plus output fits.
-    reserve = max(context.compact_buffer_tokens, turn_output_tokens(model))
-    budget = max(context.keep_tokens, window - reserve)
-    used = count_tokens(model, "\n".join((instructions, tools_text, _serialize_items(items))))
+    budget = budget_tokens(model)
+    overhead = max(min_overhead_tokens, measure_prompt_overhead(model, instructions, tools_text))
+    used = overhead + measure_items_tokens(model, items)
     if not force and used <= budget:
         return False
 
@@ -393,6 +580,18 @@ async def maybe_compact(
         return False
 
     new_items = [_checkpoint_item(summary), *recent]
+    # Summarising the head does not guarantee the result fits: the retained
+    # tail is bounded by keep_tokens, but a tool-pair snap can push it past
+    # that. Trim mechanically rather than paying for another summary call.
+    post_used = overhead + measure_items_tokens(model, new_items)
+    if post_used > budget:
+        logger.warning(
+            "compaction for %s left ~%d tok against a %d-token budget; trimming oldest turns",
+            model,
+            post_used,
+            budget,
+        )
+        new_items = guard_trim_items(model, instructions, tools_text, new_items, budget)
     rewritten = await replace_session_items(session, new_items, expected_len=len(items))
     if rewritten:
         logger.info(

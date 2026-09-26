@@ -300,6 +300,10 @@ ignore = [
 # both cost seconds to import and neither is needed until a model call is made
 # (or, for Docker, unless the Docker runtime backend is in use).
 "strix/core/execution.py" = ["PLC0415"]
+# The context guard imports the compaction/LiteLLM graph on first request:
+# the TUI runtime and the agents-graph tools import this module only for an
+# exception type and a constant, and must not pull that graph in with it.
+"strix/core/hooks.py" = ["PLC0415"]
 "strix/report/pricing.py" = ["PLC0415"]
 "strix/llm/compaction.py" = ["PLC0415"]
 "strix/llm/context_budget.py" = ["PLC0415"]

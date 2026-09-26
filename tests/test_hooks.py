@@ -2,11 +2,13 @@
 
 from __future__ import annotations
 
+from types import SimpleNamespace
 from typing import Any
 from unittest.mock import MagicMock, patch
 
 import pytest
 
+from strix.config import ContextSettings
 from strix.core.hooks import (
     BudgetExceededError,
     BudgetPausedError,
@@ -14,6 +16,7 @@ from strix.core.hooks import (
     SubagentBudgetReservedError,
     recomputed_budget_flags,
 )
+from strix.llm import compaction
 
 
 def _make_hooks(max_budget: float | None) -> ReportUsageHooks:
@@ -491,3 +494,105 @@ def test_recomputed_budget_flags(
     expected: tuple[bool, bool],
 ) -> None:
     assert recomputed_budget_flags(cost, max_budget, interactive=interactive) == expected
+
+
+def _patch_guard_budget(
+    monkeypatch: pytest.MonkeyPatch, *, window: int, turn: int, keep: int = 500
+) -> None:
+    """Pin the guard's window arithmetic and make one char cost one token."""
+    monkeypatch.setattr(compaction, "count_tokens", lambda _m, t: len(t))
+    monkeypatch.setattr(compaction, "count_tokens_cached", lambda _m, t: len(t))
+    monkeypatch.setattr(compaction, "context_window", lambda _m: window)
+    monkeypatch.setattr(compaction, "turn_output_tokens", lambda _m: turn)
+    context = ContextSettings()
+    context.compact_buffer_tokens = 1_000
+    context.keep_tokens = keep
+    monkeypatch.setattr(compaction, "load_settings", lambda: SimpleNamespace(context=context))
+
+
+def _oversized_history(turns: int, size: int) -> list[Any]:
+    items: list[Any] = [{"role": "user", "content": "opening task"}]
+    for i in range(turns):
+        items += [
+            {"type": "function_call", "call_id": f"c{i}", "name": "exec", "arguments": "{}"},
+            {"type": "function_call_output", "call_id": f"c{i}", "output": "A" * size},
+        ]
+    return items
+
+
+@pytest.mark.asyncio
+async def test_guard_trims_oversized_history_in_place(monkeypatch: pytest.MonkeyPatch) -> None:
+    # The SDK hands on_llm_start the very list it is about to send, so the
+    # trim has to land on that object for the request to shrink.
+    _patch_guard_budget(monkeypatch, window=8_000, turn=1_000)
+    hooks = ReportUsageHooks(model="test-model")
+    items = _oversized_history(10, 1_000)
+    same_list = items
+    before = len(items)
+
+    await hooks.on_llm_start(_make_warn_context(requests=1), MagicMock(), "SYSTEM", items)
+
+    assert items is same_list
+    assert len(items) < before
+    budget = compaction.budget_tokens("test-model")
+    assert compaction.measure_request_tokens("test-model", "SYSTEM", "", items) <= budget
+
+
+@pytest.mark.asyncio
+async def test_guard_leaves_a_history_within_budget_alone(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _patch_guard_budget(monkeypatch, window=100_000, turn=1_000)
+    hooks = ReportUsageHooks(model="test-model")
+    items = _oversized_history(3, 100)
+    before = list(items)
+
+    await hooks.on_llm_start(_make_warn_context(requests=1), MagicMock(), "SYSTEM", items)
+
+    assert items == before
+
+
+@pytest.mark.asyncio
+async def test_guard_runs_before_the_turn_warning_is_appended(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # The warning must survive the trim, and must not be measured as history.
+    _patch_guard_budget(monkeypatch, window=8_000, turn=1_000)
+    hooks = ReportUsageHooks(model="test-model", max_turns=100)
+    items = _oversized_history(10, 1_000)
+    before = len(items)
+
+    await hooks.on_llm_start(_make_warn_context(requests=95), MagicMock(), "SYSTEM", items)
+
+    assert len(items) < before
+    assert "[CRITICAL]" in items[-1]["content"]
+
+
+@pytest.mark.asyncio
+async def test_guard_reports_the_prompt_overhead_it_measured(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Session compaction cannot see the prepared system prompt; this is how it
+    # finds out what that fixed cost really is.
+    _patch_guard_budget(monkeypatch, window=100_000, turn=1_000)
+    hooks = ReportUsageHooks(model="test-model")
+
+    assert hooks.observed_prompt_overhead_tokens == 0
+
+    await hooks.on_llm_start(_make_warn_context(requests=1), MagicMock(), "S" * 4_000, [])
+
+    assert hooks.observed_prompt_overhead_tokens == 4_000
+
+
+@pytest.mark.asyncio
+async def test_guard_failure_never_blocks_the_turn(monkeypatch: pytest.MonkeyPatch) -> None:
+    def _boom(_model: str) -> int:
+        raise RuntimeError("budget lookup exploded")
+
+    monkeypatch.setattr(compaction, "budget_tokens", _boom)
+    hooks = ReportUsageHooks(model="test-model", max_turns=100)
+    items: list[Any] = []
+
+    await hooks.on_llm_start(_make_warn_context(requests=95), MagicMock(), "SYSTEM", items)
+
+    assert "[CRITICAL]" in items[0]["content"]

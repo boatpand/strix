@@ -27,6 +27,9 @@ _TURN_WARN_BANDS: tuple[float, ...] = (0.70, 0.85, 0.95)
 _ROOT_BUDGET_WARN_BANDS: tuple[float, ...] = (0.70, 0.85, 0.95)
 _SUBAGENT_BUDGET_WARN_BANDS: tuple[float, ...] = (0.75, 0.80, 0.85)
 _SUBAGENT_BUDGET_RESERVE = 0.90
+# A trimming guard can fire on every one of hundreds of turns; say so loudly a
+# few times, then drop to debug rather than flooding the log.
+_GUARD_LOG_LIMIT = 3
 
 
 class BudgetExceededError(RuntimeError):
@@ -133,6 +136,8 @@ class ReportUsageHooks(RunHooks[dict[str, Any]]):
         self._budget_increment = max_budget_usd
         self._max_turns = max_turns
         self._interactive = interactive
+        self._prompt_overhead_tokens = 0
+        self._guard_trims = 0
 
     def extend_budget(self) -> None:
         if self._max_budget_usd is None or self._budget_increment is None:
@@ -142,16 +147,85 @@ class ReportUsageHooks(RunHooks[dict[str, Any]]):
     async def on_llm_start(
         self,
         context: RunContextWrapper[dict[str, Any]],
-        agent: Agent[dict[str, Any]],  # noqa: ARG002
-        system_prompt: str | None,  # noqa: ARG002
+        agent: Agent[dict[str, Any]],
+        system_prompt: str | None,
         input_items: list[TResponseInputItem],
     ) -> None:
         context.context[LLM_TURN_KEY] = int(context.context.get(LLM_TURN_KEY, 0)) + 1
+        try:
+            # Before the warnings, so their few hundred tokens are covered by
+            # the reserve rather than counted as history.
+            self._enforce_context_guard(agent, system_prompt, input_items)
+        except Exception:
+            logger.exception("context guard failed")
         try:
             self._maybe_warn_turns(context, input_items)
             self._maybe_warn_budget(context, input_items)
         except Exception:
             logger.exception("budget/turn warning injection failed")
+
+    @property
+    def observed_prompt_overhead_tokens(self) -> int:
+        """Tokens the last real request spent on instructions plus tool schemas.
+
+        Session compaction runs before any request and can only see the agent's
+        own instructions, but the SDK sends a much larger prepared system
+        prompt and extra capability tool schemas. Feeding this back stops the
+        compactor from under-counting that fixed cost by several thousand
+        tokens.
+        """
+        return self._prompt_overhead_tokens
+
+    def _enforce_context_guard(
+        self,
+        agent: Agent[dict[str, Any]],
+        system_prompt: str | None,
+        input_items: list[TResponseInputItem],
+    ) -> None:
+        """Drop the oldest history so this request cannot exceed the window.
+
+        Session compaction runs once per cycle, but the SDK's loop then makes
+        up to ``max_turns`` model calls off that one check, appending a tool
+        call and its result each time. This is the only point that sees every
+        request: the SDK hands the very list it is about to send, so trimming
+        it in place is what keeps an overflow from reaching the provider.
+        """
+        from strix.llm.compaction import (
+            budget_tokens,
+            guard_trim_items,
+            measure_prompt_overhead,
+            measure_request_tokens,
+        )
+        from strix.llm.context_budget import agent_tools_text
+
+        instructions = system_prompt or ""
+        tools_text = agent_tools_text(agent)
+        self._prompt_overhead_tokens = measure_prompt_overhead(
+            self._model, instructions, tools_text
+        )
+
+        budget = budget_tokens(self._model)
+        used = measure_request_tokens(self._model, instructions, tools_text, input_items)
+        if used <= budget:
+            return
+
+        trimmed = guard_trim_items(self._model, instructions, tools_text, input_items, budget)
+        before = len(input_items)
+        # The SDK passes the list it is about to send, so mutate it in place.
+        input_items[:] = trimmed
+        self._guard_trims += 1
+        # Reaching here means proactive compaction is falling behind, which is
+        # worth saying out loud -- but it can recur on every turn, so say it a
+        # few times and then drop to debug.
+        log = logger.warning if self._guard_trims <= _GUARD_LOG_LIMIT else logger.debug
+        log(
+            "context guard trimmed %s: %d items (~%d tok) -> %d items, budget %d",
+            self._model,
+            before,
+            used,
+            len(trimmed),
+            budget,
+        )
 
     def _maybe_warn_turns(
         self,

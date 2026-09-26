@@ -35,6 +35,7 @@ from strix.core.sessions import (
 )
 from strix.llm import request_log
 from strix.llm.compaction import is_context_overflow, maybe_compact
+from strix.llm.context_budget import agent_instructions, agent_tools_text
 
 
 if TYPE_CHECKING:
@@ -90,23 +91,19 @@ def _run_config_model(run_config: RunConfig) -> str | None:
     return run_config.model if isinstance(run_config.model, str) else None
 
 
-def _agent_instructions(agent: Any) -> str:
-    instructions = getattr(agent, "instructions", None)
-    return instructions if isinstance(instructions, str) else ""
-
-
-def _agent_tools_text(agent: Any) -> str:
-    parts: list[str] = []
-    for tool in getattr(agent, "tools", []) or []:
-        name = getattr(tool, "name", "")
-        description = getattr(tool, "description", "") or ""
-        schema = getattr(tool, "params_json_schema", "") or ""
-        parts.append(f"{name} {description} {schema}")
-    return "\n".join(parts)
+def _observed_prompt_overhead(hooks: RunHooks[dict[str, Any]] | None) -> int:
+    """Instructions-plus-tools cost the run hooks measured on a real request."""
+    overhead = getattr(hooks, "observed_prompt_overhead_tokens", 0)
+    return overhead if isinstance(overhead, int) else 0
 
 
 async def _compact_session(
-    agent: Any, session: Session, run_config: RunConfig, *, force: bool
+    agent: Any,
+    session: Session,
+    run_config: RunConfig,
+    *,
+    force: bool,
+    hooks: RunHooks[dict[str, Any]] | None = None,
 ) -> bool:
     model = _run_config_model(run_config)
     if session is None or model is None:
@@ -114,8 +111,9 @@ async def _compact_session(
     return await maybe_compact(
         session,
         model=model,
-        instructions=_agent_instructions(agent),
-        tools_text=_agent_tools_text(agent),
+        instructions=agent_instructions(agent),
+        tools_text=agent_tools_text(agent),
+        min_overhead_tokens=_observed_prompt_overhead(hooks),
         force=force,
     )
 
@@ -718,7 +716,7 @@ async def _run_cycle(  # noqa: PLR0912, PLR0915
                     except Exception:
                         logger.exception("image-budget enforcement failed for %s", agent_id)
                 try:
-                    await _compact_session(agent, session, run_config, force=False)
+                    await _compact_session(agent, session, run_config, force=False, hooks=hooks)
                 except Exception:
                     logger.exception("proactive compaction failed for %s", agent_id)
                 with contextlib.suppress(Exception):
@@ -806,7 +804,9 @@ async def _run_cycle(  # noqa: PLR0912, PLR0915
                 and is_context_overflow(exc)
             ):
                 try:
-                    compacted = await _compact_session(agent, session, run_config, force=True)
+                    compacted = await _compact_session(
+                        agent, session, run_config, force=True, hooks=hooks
+                    )
                 except Exception:
                     logger.exception("overflow compaction recovery failed for %s", agent_id)
                     compacted = False

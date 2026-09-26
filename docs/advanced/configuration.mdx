@@ -49,9 +49,61 @@ Configure Strix using environment variables or a config file.
   Maximum output tokens per agent turn (`max_tokens`), including hidden reasoning/thinking tokens. When unset, Strix uses the model's output limit from LiteLLM, or `32768` for models LiteLLM doesn't recognize (e.g. self-hosted models). Always capped at half the model's context window. Raise it if a reasoning model's tool calls are truncated (`function.arguments must be valid JSON`); when set, it applies to every model.
 </ParamField>
 
-<ParamField path="STRIX_MEMORY_COMPRESSOR_TIMEOUT" default="30" type="integer">
-  Timeout in seconds for memory compression operations (context summarization).
+<ParamField path="STRIX_CONTEXT_TOKENIZER_MAP" type="string">
+  Comma-separated `substring=huggingface/repo-id` pairs mapping model names to
+  the tokenizer used to count their tokens, for models LiteLLM doesn't
+  recognize (it otherwise approximates with `cl100k_base`). Example:
+  `glm=zai-org/GLM-4.6,qwen=Qwen/Qwen3-235B-A22B`.
 </ParamField>
+
+### Context window and compaction
+
+Long scans outgrow any context window, so Strix summarises older turns into a
+checkpoint and keeps recent ones verbatim. Compaction triggers once the measured
+history exceeds:
+
+```
+context_window - (turn_output_tokens + STRIX_CONTEXT_BUFFER_TOKENS)
+```
+
+Both terms are subtracted, because they cover different things: the turn output
+cap is room the request needs for the completion it is about to ask for, and the
+buffer is slack for the gap between a local token estimate and the provider's
+own count. With the defaults on a 200k-window model that is
+`200000 - (32768 + 20000)`, so compaction starts around **147,000** tokens.
+
+Independently of compaction, every request is measured just before it is sent
+and its oldest turns are dropped if it would still exceed the window. That is a
+backstop, not the main mechanism: if you see `context guard trimmed ...` in the
+logs, compaction is falling behind and the buffer probably wants raising.
+
+<ParamField path="STRIX_CONTEXT_AUTO_COMPACT" default="true" type="boolean">
+  Whether to summarise older turns automatically as the context fills. Turning
+  this off does not disable the per-request backstop above.
+</ParamField>
+
+<ParamField path="STRIX_CONTEXT_BUFFER_TOKENS" default="20000" type="integer">
+  Headroom held back from the context window on top of the per-turn output cap,
+  absorbing the difference between Strix's token count and the provider's.
+  Raise it if scans still hit context-length errors.
+</ParamField>
+
+<ParamField path="STRIX_CONTEXT_KEEP_TOKENS" default="8000" type="integer">
+  How much of the most recent conversation is kept verbatim rather than
+  summarised. The boundary moves to keep tool calls with their results.
+</ParamField>
+
+<ParamField path="STRIX_CONTEXT_FALLBACK_TOKENS" default="200000" type="integer">
+  Context window assumed for models LiteLLM doesn't recognize. Set this to your
+  server's real window when self-hosting.
+</ParamField>
+
+<ParamField path="STRIX_CONTEXT_SUMMARY_TOKENS" default="4096" type="integer">
+  Maximum length of the checkpoint summary compaction writes.
+</ParamField>
+
+The compaction summary call uses the same timeout as every other model call
+(`LLM_TIMEOUT`).
 
 ### Dedicated deduplication model
 

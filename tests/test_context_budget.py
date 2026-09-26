@@ -83,7 +83,7 @@ def test_count_tokens_uses_custom_tokenizer_when_configured(
         lambda: SimpleNamespace(context=SimpleNamespace(tokenizer_map="weird=some/repo")),
     )
     monkeypatch.setattr(
-        "strix.llm.context_budget.litellm.create_pretrained_tokenizer",
+        "litellm.create_pretrained_tokenizer",
         lambda _repo_id: sentinel_tokenizer,
     )
 
@@ -93,7 +93,7 @@ def test_count_tokens_uses_custom_tokenizer_when_configured(
         calls.append(kwargs)
         return 7
 
-    monkeypatch.setattr("strix.llm.context_budget.litellm.token_counter", _token_counter)
+    monkeypatch.setattr("litellm.token_counter", _token_counter)
     try:
         assert context_budget.count_tokens("openai/weird-model", "hi") == 7
         assert calls == [
@@ -120,16 +120,12 @@ def test_count_tokens_falls_back_to_byte_length_when_tokenizer_load_fails(
     def _raise(_repo_id: str) -> dict[str, object]:
         raise RuntimeError("network unreachable")
 
-    monkeypatch.setattr(
-        "strix.llm.context_budget.litellm.create_pretrained_tokenizer", _raise
-    )
+    monkeypatch.setattr("litellm.create_pretrained_tokenizer", _raise)
 
     def _unexpected_call(**_kwargs: object) -> int:
         raise AssertionError("token_counter should not be called when tokenizer load fails")
 
-    monkeypatch.setattr(
-        "strix.llm.context_budget.litellm.token_counter", _unexpected_call
-    )
+    monkeypatch.setattr("litellm.token_counter", _unexpected_call)
     try:
         assert context_budget.count_tokens("openai/weird-model", "x" * 400) == 400
     finally:
@@ -149,19 +145,17 @@ def test_count_tokens_no_override_leaves_default_behavior_unchanged(
     def _unexpected_call(_repo_id: str) -> dict[str, object]:
         raise AssertionError("create_pretrained_tokenizer should not be called")
 
-    monkeypatch.setattr(
-        "strix.llm.context_budget.litellm.create_pretrained_tokenizer", _unexpected_call
-    )
+    monkeypatch.setattr("litellm.create_pretrained_tokenizer", _unexpected_call)
     calls: list[dict[str, object]] = []
 
     def _token_counter(**kwargs: object) -> int:
         calls.append(kwargs)
         return 3
 
-    monkeypatch.setattr("strix.llm.context_budget.litellm.token_counter", _token_counter)
+    monkeypatch.setattr("litellm.token_counter", _token_counter)
     try:
         assert context_budget.count_tokens("gpt-4o", "hi") == 3
-        assert calls == [{"model": "gpt-4o", "text": "hi"}]
+        assert calls == [{"model": "gpt-4o", "custom_tokenizer": None, "text": "hi"}]
     finally:
         _clear_tokenizer_caches()
 
@@ -237,3 +231,44 @@ def test_turn_output_tokens_clamped_to_half_the_context_window(
     # An unmapped model on a 32k-context server must not request its whole window.
     _patch_context(monkeypatch, fallback_context_tokens=32_768)
     assert context_budget.turn_output_tokens("openai/totally-unknown-model-xyz") == 16_384
+
+
+def test_count_tokens_cached_memoizes_by_content(monkeypatch: pytest.MonkeyPatch) -> None:
+    # The guard re-measures the whole history on every model call, so repeat
+    # content must not be re-tokenized.
+    calls: list[str] = []
+
+    def _count(_model: str, text: str) -> int:
+        calls.append(text)
+        return len(text)
+
+    monkeypatch.setattr(context_budget, "count_tokens", _count)
+    context_budget._TOKEN_MEMO.clear()
+
+    assert context_budget.count_tokens_cached("m", "hello") == 5
+    assert context_budget.count_tokens_cached("m", "hello") == 5
+    assert calls == ["hello"]
+
+    assert context_budget.count_tokens_cached("m", "other") == 5
+    assert calls == ["hello", "other"]
+    # A different model must not read another model's count.
+    assert context_budget.count_tokens_cached("n", "hello") == 5
+    assert calls == ["hello", "other", "hello"]
+
+    context_budget._TOKEN_MEMO.clear()
+
+
+def test_count_tokens_cached_evicts_oldest_entries(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(context_budget, "count_tokens", lambda _m, t: len(t))
+    monkeypatch.setattr(context_budget, "_TOKEN_MEMO_MAXSIZE", 4)
+    context_budget._TOKEN_MEMO.clear()
+
+    for i in range(10):
+        context_budget.count_tokens_cached("m", f"text-{i}")
+
+    assert len(context_budget._TOKEN_MEMO) <= 4
+    context_budget._TOKEN_MEMO.clear()
+
+
+def test_count_tokens_cached_empty_is_zero() -> None:
+    assert context_budget.count_tokens_cached("gpt-4o", "") == 0

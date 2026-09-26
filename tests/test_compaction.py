@@ -138,6 +138,7 @@ def test_select_split_handles_parallel_calls(monkeypatch: pytest.MonkeyPatch) ->
 
 def _patch_budget(monkeypatch: pytest.MonkeyPatch, *, keep_tokens: int, window: int) -> None:
     monkeypatch.setattr(compaction, "count_tokens", lambda _m, t: len(t))
+    monkeypatch.setattr(compaction, "count_tokens_cached", lambda _m, t: len(t))
     monkeypatch.setattr(compaction, "context_window", lambda _m: window)
     monkeypatch.setattr(compaction, "output_limit", lambda _m: 0)
     monkeypatch.setattr(compaction, "turn_output_tokens", lambda _m: 0)
@@ -344,3 +345,276 @@ async def test_maybe_compact_skips_when_no_room_to_summarise(
     assert await compaction.maybe_compact(session, model="m", force=True) is False
     assert not captured
     assert await session.get_items() == before
+
+
+def _patch_measure(monkeypatch: pytest.MonkeyPatch) -> None:
+    """One char per token, so expected sizes are readable in the assertions."""
+    monkeypatch.setattr(compaction, "count_tokens", lambda _m, t: len(t))
+    monkeypatch.setattr(compaction, "count_tokens_cached", lambda _m, t: len(t))
+
+
+def _patch_reserve(
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    window: int,
+    buffer: int,
+    turn: int,
+    keep: int = 8_000,
+) -> None:
+    monkeypatch.setattr(compaction, "context_window", lambda _m: window)
+    monkeypatch.setattr(compaction, "turn_output_tokens", lambda _m: turn)
+    context = ContextSettings()
+    context.compact_buffer_tokens = buffer
+    context.keep_tokens = keep
+    monkeypatch.setattr(compaction, "load_settings", lambda: SimpleNamespace(context=context))
+
+
+def _big_turns(n: int, size: int) -> list[dict[str, Any]]:
+    """Turns whose tool output dwarfs everything else, as in a real scan."""
+    items: list[dict[str, Any]] = []
+    for i in range(n):
+        items += [_call(f"c{i}"), _output(f"c{i}", "A" * size), _assistant(f"ok {i}")]
+    return items
+
+
+def test_reserve_tokens_adds_the_buffer_to_the_turn_output_cap(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # The deployment that overflowed: a 100k buffer must not be swallowed by
+    # max() picking whichever single term happens to be larger.
+    _patch_reserve(monkeypatch, window=262_144, buffer=100_000, turn=32_768)
+
+    assert compaction.reserve_tokens("m") == 132_768
+    assert compaction.budget_tokens("m") == 129_376
+
+
+def test_reserve_tokens_needs_both_terms(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Neither term alone: the reserve must exceed each of them.
+    _patch_reserve(monkeypatch, window=262_144, buffer=100_000, turn=32_768)
+    reserve = compaction.reserve_tokens("m")
+
+    assert reserve > 100_000
+    assert reserve > 32_768
+
+
+def test_reserve_tokens_clamps_the_buffer_on_a_small_window(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # A 100k buffer on a 32k model would otherwise reserve the whole window.
+    _patch_reserve(monkeypatch, window=32_768, buffer=100_000, turn=16_384, keep=8_000)
+
+    assert compaction.reserve_tokens("m") < 32_768
+    assert compaction.budget_tokens("m") >= 8_000
+
+
+def test_full_item_text_keeps_the_whole_tool_output(monkeypatch: pytest.MonkeyPatch) -> None:
+    # The summary serializer caps payloads at 2k chars. Measuring a request
+    # with it is what let a 230k-token history read as comfortably in budget.
+    _patch_measure(monkeypatch)
+    item = _output("c0", "A" * 50_000)
+
+    measured = compaction.measure_item_tokens("m", item)
+    serialized = len(compaction._serialize_item(item))
+
+    assert measured >= 50_000
+    assert measured > serialized * 10
+
+
+def test_full_item_text_counts_reasoning(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Reasoning round-trips on the wire but serializes to "" for the summary.
+    _patch_measure(monkeypatch)
+    item = {"type": "reasoning", "summary": [{"type": "summary_text", "text": "deep thought"}]}
+
+    assert compaction._serialize_item(item) == ""
+    assert "deep thought" in compaction._full_item_text(item)
+    assert compaction.measure_item_tokens("m", item) > 0
+
+
+def test_full_item_text_never_measures_an_unknown_item_as_zero(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _patch_measure(monkeypatch)
+    item = {"type": "local_shell_call", "action": {"command": "B" * 5_000}}
+
+    assert compaction._serialize_item(item) == ""
+    assert compaction.measure_item_tokens("m", item) > 5_000
+
+
+@pytest.mark.asyncio
+async def test_maybe_compact_sees_untruncated_tool_output(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # A history whose truncated rendering fits the window but whose real
+    # payload does not: the exact shape of the reported overflow.
+    _patch_budget(monkeypatch, keep_tokens=100, window=60_000)
+    _patch_summary(monkeypatch, "SUMMARY BODY")
+    items = [_user("opening"), *_big_turns(6, 20_000)]
+    session = FakeSession(items)
+
+    assert len(compaction._serialize_items(items)) < 60_000
+    assert compaction.measure_items_tokens("m", items) > 60_000
+    assert await compaction.maybe_compact(session, model="m") is True
+
+
+def test_select_split_bounds_the_kept_tail_by_real_size(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Measured through the truncating serializer, six 5k outputs read as ~12k
+    # and all six would be kept; measured honestly, only the newest fit.
+    _patch_measure(monkeypatch)
+    items = [_user("opening"), *_big_turns(6, 5_000)]
+
+    split = compaction._select_split("m", items, keep_tokens=12_000)
+
+    assert compaction.measure_items_tokens("m", items[split:]) <= 12_000
+    assert not _has_orphan_tool_output(items[split:])
+
+
+def test_guard_split_snaps_forward_through_parallel_calls(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # _select_split snaps backwards, growing the tail -- fine when the head is
+    # still summarised, but a hard cap must shrink instead.
+    _patch_measure(monkeypatch)
+    items = [
+        _user("go"),
+        _call("a"),
+        _call("b"),
+        _output("a", "A" * 2_000),
+        _output("b", "B" * 2_000),
+        _assistant("done"),
+    ]
+    budget = 2_500
+
+    guard_tail = items[compaction._guard_split("m", items, budget) :]
+    select_tail = items[compaction._select_split("m", items, budget) :]
+
+    assert compaction.measure_items_tokens("m", guard_tail) <= budget
+    assert not _has_orphan_tool_output(guard_tail)
+    # The compaction split would have gone the other way and overshot.
+    assert compaction.measure_items_tokens("m", select_tail) > budget
+
+
+def test_guard_trim_drops_oldest_until_it_fits(monkeypatch: pytest.MonkeyPatch) -> None:
+    _patch_measure(monkeypatch)
+    items = [_user("opening task"), *_big_turns(10, 1_000)]
+    budget = 5_000
+
+    trimmed = compaction.guard_trim_items("m", "", "", items, budget)
+
+    assert compaction.measure_request_tokens("m", "", "", trimmed) <= budget
+    assert not _has_orphan_tool_output(trimmed)
+    assert trimmed[0] is items[0]
+    assert compaction._ELISION_TAG in trimmed[1]["content"]
+    assert trimmed[-1] is items[-1]
+
+
+def test_guard_trim_preserves_the_checkpoint(monkeypatch: pytest.MonkeyPatch) -> None:
+    # The checkpoint holds every finding compacted away so far.
+    _patch_measure(monkeypatch)
+    checkpoint = compaction._checkpoint_item("EARLIER FINDINGS")
+    items = [checkpoint, *_big_turns(10, 1_000)]
+
+    trimmed = compaction.guard_trim_items("m", "", "", items, 4_000)
+
+    assert trimmed[0] is checkpoint
+    assert "EARLIER FINDINGS" in trimmed[0]["content"]
+    assert compaction.measure_request_tokens("m", "", "", trimmed) <= 4_000
+
+
+def test_guard_trim_never_rewrites_item_payloads(monkeypatch: pytest.MonkeyPatch) -> None:
+    # These dicts may be the session's own, so only the list may change.
+    _patch_measure(monkeypatch)
+    items = [_user("opening"), *_big_turns(10, 1_000)]
+    before = [dict(item) for item in items]
+
+    trimmed = compaction.guard_trim_items("m", "", "", items, 5_000)
+
+    assert items == before
+    original_ids = {id(item) for item in items}
+    added = [item for item in trimmed if id(item) not in original_ids]
+    assert len(added) == 1
+    assert compaction._ELISION_TAG in added[0]["content"]
+
+
+def test_guard_trim_is_a_noop_within_budget(monkeypatch: pytest.MonkeyPatch) -> None:
+    _patch_measure(monkeypatch)
+    items = [_user("opening"), *_big_turns(2, 100)]
+
+    assert compaction.guard_trim_items("m", "", "", items, 100_000) == items
+
+
+def test_guard_trim_counts_instructions_and_tools(monkeypatch: pytest.MonkeyPatch) -> None:
+    # The prepared system prompt and tool schemas share the same window.
+    _patch_measure(monkeypatch)
+    items = [_user("opening"), *_big_turns(10, 1_000)]
+    budget = 6_000
+
+    lean = compaction.guard_trim_items("m", "", "", items, budget)
+    heavy = compaction.guard_trim_items("m", "S" * 3_000, "T" * 1_000, items, budget)
+
+    assert len(heavy) < len(lean)
+    assert compaction.measure_request_tokens("m", "S" * 3_000, "T" * 1_000, heavy) <= budget
+
+
+@pytest.mark.asyncio
+async def test_force_compacts_a_short_session_of_huge_items(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Overflow recovery must not be blocked by the item-count gate: five
+    # enormous items are exactly the case that needs compacting.
+    _patch_budget(monkeypatch, keep_tokens=100, window=10_000)
+    _patch_summary(monkeypatch, "SUMMARY BODY")
+    items = [
+        _user("go"),
+        _call("c0"),
+        _output("c0", "A" * 9_000),
+        _assistant("ok"),
+        _user("next"),
+    ]
+    assert len(items) < compaction._MIN_ITEMS_TO_COMPACT
+    session = FakeSession(items)
+
+    assert await compaction.maybe_compact(session, model="m", force=True) is True
+    assert await compaction.maybe_compact(FakeSession(list(items)), model="m") is False
+
+
+@pytest.mark.asyncio
+async def test_maybe_compact_trims_when_the_summary_leaves_it_over_budget(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    # Summarising the head does not guarantee the result fits.
+    _patch_budget(monkeypatch, keep_tokens=5_000, window=4_000)
+    _patch_summary(monkeypatch, "SUMMARY BODY")
+    items = [_user("opening"), *_big_turns(8, 800)]
+    session = FakeSession(items)
+
+    with caplog.at_level("WARNING", logger="strix.llm.compaction"):
+        assert await compaction.maybe_compact(session, model="m", force=True) is True
+
+    final = await session.get_items()
+    assert final[0]["content"].startswith(compaction._CHECKPOINT_TAG)
+    assert "SUMMARY BODY" in final[0]["content"]
+    assert compaction.measure_items_tokens("m", final) <= compaction.budget_tokens("m")
+    assert not _has_orphan_tool_output(final)
+    assert any("trimming oldest turns" in record.message for record in caplog.records)
+
+
+@pytest.mark.asyncio
+async def test_maybe_compact_honours_the_observed_prompt_overhead(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # The agent object carries only its own instructions; the SDK sends a much
+    # larger prepared system prompt, which the hooks report back.
+    _patch_budget(monkeypatch, keep_tokens=100, window=10_000)
+    _patch_summary(monkeypatch, "SUMMARY BODY")
+    items = [_user("opening"), *_big_turns(3, 2_000)]
+
+    assert await compaction.maybe_compact(FakeSession(list(items)), model="m") is False
+    assert (
+        await compaction.maybe_compact(
+            FakeSession(list(items)), model="m", min_overhead_tokens=6_000
+        )
+        is True
+    )

@@ -4,7 +4,9 @@ large configurable fallback for models LiteLLM doesn't map.
 
 from __future__ import annotations
 
+import hashlib
 import logging
+from collections import OrderedDict
 from functools import lru_cache
 from typing import Any
 
@@ -100,6 +102,8 @@ def _load_custom_tokenizer(repo_id: str) -> dict[str, Any] | None:
     retried at most once per process, not on every ``count_tokens`` call.
     """
     try:
+        import litellm
+
         return dict(litellm.create_pretrained_tokenizer(repo_id))
     except Exception:  # noqa: BLE001 - network/repo issues must not crash the scan.
         logger.warning("Failed to load tokenizer %r; falling back to byte-length", repo_id)
@@ -142,21 +146,60 @@ def count_tokens(model: str, text: str) -> int:
     if not text:
         return 0
     repo_id = _tokenizer_repo_for(model)
-    if repo_id is not None:
-        tokenizer = _load_custom_tokenizer(repo_id)
-        if tokenizer is None:
-            return len(text.encode("utf-8"))
-        try:
-            return int(
-                litellm.token_counter(
-                    model=_lookup_key(model), custom_tokenizer=tokenizer, text=text
-                )
-            )
-        except Exception:  # noqa: BLE001 - tokenizer may reject this text.
-            return len(text.encode("utf-8"))
+    tokenizer = _load_custom_tokenizer(repo_id) if repo_id is not None else None
+    if repo_id is not None and tokenizer is None:
+        # A configured tokenizer that will not load: stay conservative rather
+        # than falling back to LiteLLM's cl100k_base approximation.
+        return len(text.encode("utf-8"))
     try:
         import litellm
 
-        return int(litellm.token_counter(model=_lookup_key(model), text=text))
-    except Exception:  # noqa: BLE001 - tokenizer may be unavailable for some models.
+        return int(
+            litellm.token_counter(model=_lookup_key(model), custom_tokenizer=tokenizer, text=text)
+        )
+    except Exception:  # noqa: BLE001 - tokenizer may be unavailable or reject this text.
         return len(text.encode("utf-8"))
+
+
+# Budget checks re-measure the whole history on every model call, and tokenizing
+# a full window costs ~0.1-0.3s. History items are immutable once appended, so
+# memoizing by content digest makes the steady-state cost O(newly added items).
+_TOKEN_MEMO: OrderedDict[tuple[str, str], int] = OrderedDict()
+_TOKEN_MEMO_MAXSIZE = 8_192
+
+
+def count_tokens_cached(model: str, text: str) -> int:
+    """``count_tokens`` memoized by ``(model, content digest)``.
+
+    Keyed by a digest rather than the text itself so the cache never retains
+    megabytes of tool output.
+    """
+    if not text:
+        return 0
+    key = (model, hashlib.blake2b(text.encode("utf-8"), digest_size=16).hexdigest())
+    cached = _TOKEN_MEMO.get(key)
+    if cached is not None:
+        _TOKEN_MEMO.move_to_end(key)
+        return cached
+    value = count_tokens(model, text)
+    _TOKEN_MEMO[key] = value
+    if len(_TOKEN_MEMO) > _TOKEN_MEMO_MAXSIZE:
+        _TOKEN_MEMO.popitem(last=False)
+    return value
+
+
+def agent_instructions(agent: Any) -> str:
+    """The agent's own instructions text, for budget estimation."""
+    instructions = getattr(agent, "instructions", None)
+    return instructions if isinstance(instructions, str) else ""
+
+
+def agent_tools_text(agent: Any) -> str:
+    """Rendered tool schemas for ``agent``, for budget estimation."""
+    parts: list[str] = []
+    for tool in getattr(agent, "tools", []) or []:
+        name = getattr(tool, "name", "")
+        description = getattr(tool, "description", "") or ""
+        schema = getattr(tool, "params_json_schema", "") or ""
+        parts.append(f"{name} {description} {schema}")
+    return "\n".join(parts)
